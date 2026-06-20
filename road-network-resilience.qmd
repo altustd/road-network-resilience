@@ -1,0 +1,453 @@
+---
+title: "The Intersections That Hold a City: Road Network Resilience in Pittsburgh"
+author: "Troy Altus"
+date: "June 2026"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-align: center
+    self-contained: true
+  pdf:
+    documentclass: article
+    classoption: [letterpaper, 11pt]
+    geometry:
+      - top=1in
+      - bottom=1in
+      - left=1.25in
+      - right=1in
+    number-sections: true
+    colorlinks: true
+    toc: true
+    pdf-engine: latexmk
+    pdf-engine-opts:
+      - -lualatex
+bibliography: references.bib
+execute:
+  warning: false
+  message: false
+  echo: false
+jupyter: road-network-resilience
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+import pickle
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import osmnx as ox
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy import stats
+
+ox.settings.use_cache = True
+ox.settings.log_console = False
+
+CACHE = Path("data/processed/pittsburgh_drive.pkl")
+PLACE = "Pittsburgh, Pennsylvania, USA"
+
+if CACHE.exists():
+    with open(CACHE, "rb") as f:
+        data = pickle.load(f)
+    G_dir      = data["G_dir"]
+    G_lcc      = data["G_lcc"]
+    n_weak_comp = data["n_weak_comp"]
+else:
+    G_raw = ox.graph_from_place(PLACE, network_type="drive")
+    G     = G_raw if G_raw.graph.get("simplified") else ox.simplify_graph(G_raw)
+    n_weak_comp = nx.number_weakly_connected_components(G)
+    G_dir = ox.truncate.largest_component(G)
+    G_u   = nx.Graph(ox.convert.to_undirected(G_dir))
+    lcc   = max(nx.connected_components(G_u), key=len)
+    G_lcc = G_u.subgraph(lcc).copy()
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CACHE, "wb") as f:
+        pickle.dump({
+            "G_dir": G_dir, "G_lcc": G_lcc, "n_weak_comp": n_weak_comp,
+        }, f)
+
+N       = G_lcc.number_of_nodes()
+M       = G_lcc.number_of_edges()
+degrees = np.array([d for _, d in G_lcc.degree()])
+avg_k   = float(degrees.mean())
+max_k   = int(degrees.max())
+density = nx.density(G_lcc)
+
+deg_counter = Counter(degrees.tolist())
+k_unique    = np.array(sorted(deg_counter.keys()))
+ccdf_k      = k_unique[k_unique > 0]
+ccdf_p      = np.array([
+    sum(deg_counter[kk] for kk in deg_counter if kk >= k) / N
+    for k in ccdf_k
+])
+mask = (ccdf_p > 0) & (ccdf_k > 0)
+slope, intercept, r_val, _, _ = stats.linregress(
+    np.log(ccdf_k[mask]), np.log(ccdf_p[mask])
+)
+gamma_hat = float(1 - slope)
+r2        = float(r_val ** 2)
+```
+
+```{python}
+#| label: compute-slow
+#| include: false
+
+C = float(nx.average_clustering(G_lcc))
+
+# Sampled average path length for tractability on large street graphs
+rng = np.random.default_rng(42)
+sample_n = min(400, N)
+sample_nodes = rng.choice(list(G_lcc.nodes()), size=sample_n, replace=False)
+path_lengths = []
+for src in sample_nodes:
+    lengths = nx.single_source_shortest_path_length(G_lcc, src)
+    path_lengths.extend(lengths.values())
+L = float(np.mean(path_lengths))
+
+C_rand = avg_k / N
+L_rand = float(np.log(N) / np.log(avg_k))
+sigma  = float((C / C_rand) / (L / L_rand))
+
+betweenness = nx.betweenness_centrality(G_lcc, normalized=True)
+bc_series   = pd.Series(betweenness).sort_values(ascending=False)
+top_bc_20   = bc_series.head(20)
+
+bc_df = pd.DataFrame({
+    "node":        top_bc_20.index,
+    "betweenness": top_bc_20.values,
+    "degree":      [G_lcc.degree(n) for n in top_bc_20.index],
+    "x":           [G_lcc.nodes[n]["x"] for n in top_bc_20.index],
+    "y":           [G_lcc.nodes[n]["y"] for n in top_bc_20.index],
+}).reset_index(drop=True)
+
+sw_table = pd.DataFrame({
+    "Metric":       ["Avg. clustering C", "Avg. path length L (sampled)", "σ (small-world coeff.)"],
+    "Observed":     [f"{C:.4f}", f"{L:.2f}", f"{sigma:.1f}"],
+    "Random graph": [f"{C_rand:.4f}", f"{L_rand:.2f}", "—"],
+    "Ratio":        [f"{C/C_rand:.1f}×", f"{L/L_rand:.2f}×", "—"],
+})
+```
+
+```{python}
+#| label: compute-robustness
+#| include: false
+
+def robustness_curve(G, order, n_steps, step=1):
+    H  = G.copy()
+    N0 = H.number_of_nodes()
+    s  = [1.0]
+    removed = 0
+    for node in order:
+        if node not in H:
+            continue
+        H.remove_node(node)
+        removed += 1
+        if removed % step != 0 and removed < n_steps:
+            continue
+        if H.number_of_nodes() == 0:
+            s.append(0.0)
+        else:
+            s.append(max(len(c) for c in nx.connected_components(H)) / N0)
+        if removed >= n_steps:
+            break
+    return np.array(s)
+
+n_steps = min(800, N - 1)
+step    = max(1, n_steps // 200)
+
+targeted_order = sorted(G_lcc.nodes(), key=betweenness.get, reverse=True)
+rng            = np.random.default_rng(42)
+random_order   = rng.permutation(list(G_lcc.nodes())).tolist()
+
+targeted_S = robustness_curve(G_lcc, targeted_order, n_steps, step=step)
+random_S   = robustness_curve(G_lcc, random_order,   n_steps, step=step)
+f_vals     = np.linspace(0, len(targeted_S) / (n_steps / step + 1) * (n_steps / N), len(targeted_S))
+f_vals     = np.linspace(0, n_steps / N, len(targeted_S))
+
+idx_targeted_50 = int(np.argmax(targeted_S < 0.5)) if np.any(targeted_S < 0.5) else len(targeted_S) - 1
+f_collapse_50   = float(f_vals[idx_targeted_50]) if idx_targeted_50 > 0 else float(f_vals[-1])
+```
+
+## Abstract
+
+A bridge closure, a water-main dig, a protest that blocks one downtown intersection — and suddenly everyone is late. Urban road networks look like grids on a map, but at the level of topology they are sparse graphs whose resilience depends on a handful of intersections that carry far more traffic than their neighbors. This study applies network science to Pittsburgh's driveable street network, downloaded from OpenStreetMap via OSMnx [@boeing2024osmnx], and asks three structural questions: whether the degree distribution is heavy-tailed, whether the network exhibits small-world topology, and how connectivity fragments under random intersection closure versus targeted removal of high-betweenness nodes. The Pittsburgh network comprises `{python} f"{N:,}"` intersections and `{python} f"{M:,}"` street segments in its largest connected component, with mean degree `{python} f"{avg_k:.2f}"`. The topology is strongly small-world (σ = `{python} f"{sigma:.1f}"`) and moderately heterogeneous. Under targeted attack on the most central intersections, the largest connected component collapses after removing only `{python} f"{f_collapse_50:.0%}"` of nodes; under random failure, the network tolerates substantially more loss before fragmenting. The gap between the two curves quantifies the everyday risk embedded in urban street design: most closures are harmless, but the right closure is catastrophic.
+
+## Introduction
+
+Every driver knows the difference between a random detour and a structural one. A tree falls across a residential side street and life continues. The same storm closes the Fort Pitt Tunnel approach and half the city rearranges its morning. The distinction is not merely congestion — it is connectivity. Some intersections are load-bearing in a sense that has nothing to do with asphalt thickness.
+
+Urban street networks have been studied as graphs since long before the term "network science" entered common use. @porta2006multiple showed that multiple centrality measures — degree, betweenness, closeness — reveal different layers of urban structure when applied to the primal graph of intersections and streets. @latora2001efficient introduced an efficiency functional for street networks that connects topological path length to the economic cost of movement through a city. The present analysis adopts the standard primal representation: nodes are intersections, edges are street segments, and the graph is undirected after simplifying parallel edges.
+
+Three questions organize this paper, continuing a series that has already examined the US airport route map and a synthetic transmission grid:
+
+1. **Topology:** Is Pittsburgh's street network heterogeneous in degree, and does it exhibit small-world structure?
+2. **Centrality:** Which intersections are structural bottlenecks, and do they coincide with high-degree hubs?
+3. **Robustness:** How does the network fragment under random intersection closure versus targeted removal of the most central nodes?
+
+## Data
+
+### Source and Acquisition
+
+Street centerline data are drawn from OpenStreetMap (OSM) and retrieved with OSMnx [@boeing2024osmnx], a Python package that downloads, constructs, analyzes, and visualizes street networks from OSM's routable graph. The study area is the City of Pittsburgh, Pennsylvania — a mid-size American city with a mix of gridiron downtown blocks, river-constrained corridors, and hill-country arterials that make it a representative rather than pathological case.
+
+The network is restricted to the **drive** module: edges represent streets on which a passenger vehicle can legally travel. One-way streets are retained in the directed download but converted to an undirected graph for structural analysis, following the convention in @porta2006multiple. Self-loops and parallel edges are removed by OSMnx's `simplify_graph` routine, which collapses intermediate degree-2 nodes into single edges between true intersections.
+
+```{python}
+#| label: tbl-datastats
+#| tbl-cap: "Network statistics for Pittsburgh's largest connected street component."
+
+stats_df = pd.DataFrame({
+    "Statistic": [
+        "Intersections (nodes)",
+        "Street segments (edges)",
+        "Mean degree ⟨k⟩",
+        "Maximum degree",
+        "Graph density",
+        "Connected components (full graph)",
+        "LCC fraction of nodes",
+    ],
+    "Value": [
+        f"{N:,}",
+        f"{M:,}",
+        f"{avg_k:.3f}",
+        f"{max_k}",
+        f"{density:.5f}",
+        f"{n_weak_comp}",
+        f"{N / G_dir.number_of_nodes():.1%}",
+    ],
+})
+
+stats_df.style.hide(axis="index").set_properties(**{
+    "text-align": "center",
+    "font-family": "monospace",
+}).set_properties(subset=["Statistic"], **{"text-align": "left"})
+```
+
+The low mean degree reflects a fundamental constraint of physical street networks: most intersections connect only two to four streets. The maximum degree of `{python} max_k` identifies a small number of hub intersections where many arterials meet — the natural candidates for structural importance.
+
+## Methods
+
+### Graph Construction
+
+OSM data are downloaded for `Pittsburgh, Pennsylvania, USA`, simplified, converted to undirected form, and truncated to the largest connected component. Analysis is performed on this component using NetworkX [@hagberg2008exploring].
+
+### Degree Distribution
+
+The complementary cumulative distribution function (CCDF) $P(K \geq k)$ characterizes degree heterogeneity. A power-law fit in log–log space yields exponent $\hat{\gamma} = 1 - \hat{\beta}$ where $\hat{\beta}$ is the regression slope; $R^2$ assesses goodness of fit.
+
+### Small-World Metrics
+
+The global clustering coefficient $C$ and average shortest path length $L$ are compared to an Erdős–Rényi random graph with the same $N$ and $\langle k \rangle$ [@watts1998collective]:
+
+$$C_{\text{rand}} \approx \frac{\langle k \rangle}{N}, \qquad L_{\text{rand}} \approx \frac{\ln N}{\ln \langle k \rangle}, \qquad \sigma = \frac{C/C_{\text{rand}}}{L/L_{\text{rand}}}.$$
+
+Because exact all-pairs shortest paths are expensive on graphs with tens of thousands of nodes, $L$ is estimated from 400 randomly sampled source nodes.
+
+### Betweenness Centrality
+
+Normalized betweenness centrality $g(v) \in [0,1]$ measures the fraction of shortest paths that pass through intersection $v$. High-betweenness nodes are structural chokepoints whose closure forces long detours.
+
+### Robustness Simulation
+
+Two removal protocols are applied:
+
+- **Random failure:** intersections removed in uniformly random order (seed 42).
+- **Targeted attack:** intersections removed in descending order of pre-computed betweenness centrality (static ranking).
+
+After each removal step, the size of the largest connected component (LCC) as a fraction of the original network is recorded. Steeper decline under targeted attack confirms the robust-yet-fragile pattern predicted for heterogeneous networks [@albert2000error].
+
+## Results
+
+### Degree Distribution
+
+```{python}
+#| label: fig-degree
+#| fig-cap: "Complementary CDF of intersection degree on a log–log scale. Street networks typically show moderate heavy-tailed behavior — most intersections are low-degree, with a thin tail of hub junctions."
+
+k_fit = np.logspace(np.log10(float(ccdf_k.min())), np.log10(float(ccdf_k.max())), 80)
+p_fit = np.exp(intercept) * k_fit ** slope
+
+fig_deg = go.Figure()
+fig_deg.add_trace(go.Scatter(
+    x=ccdf_k, y=ccdf_p,
+    mode="markers",
+    marker=dict(color="#185FA5", size=7, opacity=0.85),
+    name="Empirical CCDF",
+))
+fig_deg.add_trace(go.Scatter(
+    x=k_fit, y=p_fit,
+    mode="lines",
+    line=dict(color="#D85A30", dash="dash", width=2),
+    name=f"Power-law fit  γ̂ = {gamma_hat:.2f},  R² = {r2:.2f}",
+))
+fig_deg.update_layout(
+    xaxis=dict(type="log", title="Degree k"),
+    yaxis=dict(type="log", title="P(K ≥ k)"),
+    template="plotly_white",
+    height=420,
+)
+fig_deg.show()
+```
+
+The degree distribution is right-skewed: `{python} f"{(degrees <= 3).mean():.0%}"` of intersections have degree three or less, while a thin tail reaches degree `{python} max_k`. The power-law fit yields $\hat{\gamma} =$ `{python} f"{gamma_hat:.2f}"` with $R^2 =$ `{python} f"{r2:.2f}"` — moderate heavy-tailed behavior, consistent with planned urban grids punctuated by arterial hubs rather than the pure preferential attachment of scale-free models [@barabasi1999emergence].
+
+### Small-World Properties
+
+```{python}
+#| label: tbl-smallworld
+#| tbl-cap: "Small-world metrics for Pittsburgh's street network versus an equivalent random graph."
+
+sw_table.style.hide(axis="index").set_properties(**{
+    "text-align": "center",
+    "font-family": "monospace",
+}).set_properties(subset=["Metric"], **{"text-align": "left"})
+```
+
+The clustering coefficient vastly exceeds the random-graph expectation (@tbl-smallworld). This is the signature of grid neighborhoods: if two streets both connect to the same intersection, they often share additional connections through the local mesh. Despite high local clustering, average path lengths remain short — Pittsburgh's arterials and bridges act as a backbone that keeps distant neighborhoods within a small number of hops. The small-world coefficient σ ≫ 1 confirms this dual property [@watts1998collective].
+
+### Geographic Map
+
+```{python}
+#| label: fig-map
+#| fig-cap: "Pittsburgh street network colored by intersection degree (brighter = more connections). River valleys and downtown corridors concentrate high-degree hubs."
+
+node_x = [G_lcc.nodes[n]["x"] for n in G_lcc.nodes()]
+node_y = [G_lcc.nodes[n]["y"] for n in G_lcc.nodes()]
+node_k = [G_lcc.degree(n) for n in G_lcc.nodes()]
+
+edge_x, edge_y = [], []
+for u, v in G_lcc.edges():
+    xu, yu = G_lcc.nodes[u]["x"], G_lcc.nodes[u]["y"]
+    xv, yv = G_lcc.nodes[v]["x"], G_lcc.nodes[v]["y"]
+    edge_x += [xu, xv, None]
+    edge_y += [yu, yv, None]
+
+fig_map = go.Figure()
+fig_map.add_trace(go.Scatter(
+    x=edge_x, y=edge_y,
+    mode="lines",
+    line=dict(width=0.4, color="#c8c8c8"),
+    hoverinfo="none",
+    showlegend=False,
+))
+fig_map.add_trace(go.Scatter(
+    x=node_x, y=node_y,
+    mode="markers",
+    marker=dict(
+        size=3,
+        color=node_k,
+        colorscale="Plasma",
+        showscale=True,
+        colorbar=dict(title="Degree", thickness=12, len=0.55),
+        opacity=0.75,
+    ),
+    hoverinfo="skip",
+    showlegend=False,
+))
+fig_map.update_layout(
+    xaxis=dict(visible=False),
+    yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
+    template="plotly_white",
+    height=520,
+    margin=dict(l=10, r=10, t=10, b=10),
+)
+fig_map.show()
+```
+
+The geographic layout reveals structure that abstract graph statistics alone cannot: degree concentrates along the river corridors and downtown grid, while residential hillsides form lower-degree branches. The three rivers that define Pittsburgh's geography are not merely scenery — they constrain the edge set and force traffic through a limited set of bridges and tunnels, elevating the betweenness of the nodes that serve them.
+
+### Betweenness Centrality
+
+```{python}
+#| label: fig-betweenness
+#| fig-cap: "Top 20 intersections by normalized betweenness centrality. These are the load-bearing junctions whose closure would force the largest detours."
+
+vmin, vmax = bc_df["degree"].min(), bc_df["degree"].max()
+norm_deg = [(v - vmin) / max(vmax - vmin, 1) for v in bc_df["degree"]]
+colors   = px.colors.sample_colorscale("Plasma", norm_deg)
+
+fig_bc = go.Figure(go.Bar(
+    x=bc_df["betweenness"],
+    y=[f"Node {int(n):6d}  (k={d})" for n, d in zip(bc_df["node"], bc_df["degree"])],
+    orientation="h",
+    marker_color=colors,
+))
+fig_bc.update_layout(
+    xaxis_title="Normalized betweenness centrality",
+    yaxis=dict(autorange="reversed", tickfont=dict(family="monospace", size=11)),
+    template="plotly_white",
+    height=540,
+    margin=dict(l=180),
+)
+fig_bc.show()
+```
+
+Betweenness is highly concentrated (@fig-betweenness). The top intersection accounts for a disproportionate share of all shortest paths — a pattern that aligns with operational experience: closing a downtown distributor or a bridge approach fragments the network far more than closing a residential cul-de-sac, regardless of how many cars either street normally carries.
+
+### Robustness Analysis
+
+```{python}
+#| label: fig-robustness
+#| fig-cap: "Network robustness under random intersection closure and targeted attack on high-betweenness nodes. The y-axis shows the largest connected component as a fraction of the original network."
+
+fig_rob = go.Figure()
+fig_rob.add_trace(go.Scatter(
+    x=f_vals, y=random_S,
+    mode="lines",
+    name="Random failure",
+    line=dict(color="#185FA5", width=2.5),
+))
+fig_rob.add_trace(go.Scatter(
+    x=f_vals, y=targeted_S,
+    mode="lines",
+    name="Targeted attack (betweenness order)",
+    line=dict(color="#D85A30", width=2.5),
+    fill="tozeroy",
+    fillcolor="rgba(216,90,48,0.08)",
+))
+if idx_targeted_50 > 0:
+    fig_rob.add_vline(
+        x=f_collapse_50,
+        line=dict(color="#888780", dash="dot", width=1.5),
+        annotation_text=f"  50% fragmentation<br>  at {f_collapse_50:.0%} removal",
+        annotation_font_size=11,
+    )
+fig_rob.update_layout(
+    xaxis=dict(title="Fraction of intersections removed", tickformat=".0%"),
+    yaxis=dict(title="Largest connected component (fraction of original)", range=[0, 1.05]),
+    template="plotly_white",
+    height=460,
+    legend=dict(x=0.55, y=0.95),
+)
+fig_rob.show()
+```
+
+The divergence between the two curves is the central empirical result. Under random failure — analogous to scattered closures from construction, accidents, or weather — the LCC shrinks slowly: random removal rarely hits a high-betweenness chokepoint. Under targeted attack — removing intersections in descending betweenness order — the network fragments rapidly, reaching 50% LCC loss after removing only `{python} f"{f_collapse_50:.0%}"` of nodes.
+
+This is the same robust-yet-fragile asymmetry @albert2000error identified in scale-free networks, and it appears here despite the street network not being purely scale-free. The mechanism is structural: a small set of intersections bridge communities separated by rivers, hills, or irregular grid boundaries. Their removal disconnects regions that the local grid alone cannot reconnect.
+
+## Discussion
+
+Several implications follow for urban mobility and infrastructure planning.
+
+**Resilience planning should prioritize by betweenness, not by traffic volume.** The busiest intersection by daily vehicle count is not necessarily the most structurally critical by betweenness. Emergency routing and pre-positioned detour plans should be aligned with topological centrality, not congestion maps alone.
+
+**Redundancy is geographic, not just local.** Adding streets within a neighborhood increases local clustering but may do little for global resilience if the neighborhood remains connected to the rest of the city through a single bridge or tunnel. Investments that create alternative inter-regional routes — second river crossings, parallel arterials — flatten the targeted-attack curve more effectively than grid extensions within already well-connected districts.
+
+**OSM data quality matters.** OpenStreetMap coverage in Pittsburgh is good but not perfect; private campuses, construction closures, and time-of-day restrictions are absent. A weighted analysis using traffic counts or travel-time data would sharpen the operational picture.
+
+## Conclusion
+
+Pittsburgh's street network is a small-world graph with moderate degree heterogeneity and highly concentrated betweenness. It tolerates random intersection closures with surprising grace and fractures quickly when its structural chokepoints are removed. The topology makes visible what every commuter intuits: most detours are minor, but the right detour is everyone else's problem.
+
+This study continues a network analysis series examining the hidden graphs behind everyday infrastructure — from the flights that connect cities in the sky to the transmission lines that power them, and now the streets that bind a city together at ground level.
+
+## References
