@@ -1,5 +1,6 @@
 ---
-title: "The Intersections That Hold a City: Road Network Resilience in Pittsburgh"
+title: "When One Intersection Closes"
+subtitle: "Hidden Maps · Episode 3 — Pittsburgh's Street Network"
 author: "Troy Altus"
 date: "June 2026"
 format:

@@ -1,4 +1,4 @@
-# The Intersections That Hold a City
+# When One Intersection Closes
 
 *A Network Analysis of Urban Road Resilience*
 
